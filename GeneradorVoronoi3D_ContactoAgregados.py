@@ -30,7 +30,7 @@ H = 150
 D = 200
 
 # Fracción volumétrica de agregados sobre el total del dominio
-frac_agregado = 0.7
+frac_agregado = 0.2
 
 # Tipos de agregado: (nombre, d_min [mm], d_max [mm], fracción del total de agregado)
 # Las fracciones deben sumar 1.0. Para agregar otro tipo añadir una fila más.
@@ -46,21 +46,21 @@ semilla = None
 
 # Elongación: factor > 1, fracción de partículas afectadas (0.0 a 1.0)
 elongacion     = 3
-porc_elongadas = 0
+porc_elongadas = 0.3
 
 # Aplanamiento: factor < 1, fracción de partículas afectadas (0.0 a 1.0)
 aplanamiento   = 0.8
-porc_aplanadas = 0
+porc_aplanadas = 0.3
 
 # Tolerancia de volumen en asignación y número máximo de semillas Voronoi
 tol          = 0.02
-max_semillas = 10000
+max_semillas = 1000
 
 # Celdas Voronoi objetivo por partícula de agregado.
 # Más alto, menor tamaño de celda, más celdas por partícula, mayor fracción real.
-N_cel_por_part = 30
+N_cel_por_part = 15
 
-usar_paralelo = False
+usar_paralelo = True
 n_procesos    = 0
 
 # Colores de visualización: índice 0 = matriz, 1..N = tipos de agregado
@@ -335,9 +335,9 @@ import concurrent.futures as _cf
 
 _EXEC = None
 
-# Crea (una sola vez) el pool de procesos para las tareas paralelas. Usa n_procesos
+# Crea una sola vez el grupo de procesos para las tareas paralelas. Usa n_procesos
 # si se fijó, o todos los núcleos disponibles.
-def _get_exec():
+def _obtener_ejecutor():
     global _EXEC
     if _EXEC is None:
         nproc = n_procesos if n_procesos and n_procesos > 0 else (os.cpu_count() or 1)
@@ -345,29 +345,48 @@ def _get_exec():
     return _EXEC
 
 
-# Worker: ordena y recorta una cara interna a partir de sus vértices crudos. Se
-# ejecuta en los procesos del pool, por eso no toca estructuras globales.
-def _geom_cara_interna(arista_vor):
+# Devuelve el volumen del casco convexo de un conjunto de puntos.
+def _volumen_de_puntos(pts):
+    try:
+        return float(ConvexHull(np.asarray(pts, dtype=float)).volume)
+    except Exception:
+        return 0.0
+
+
+# Calcula el volumen de muchas celdas, en paralelo si está activado y hay bastantes.
+def _volumenes_de_celdas(lista_pts):
+    if not usar_paralelo or len(lista_pts) < 1500:
+        return [_volumen_de_puntos(p) for p in lista_pts]
+    try:
+        ex = _obtener_ejecutor()
+        return list(ex.map(_volumen_de_puntos, lista_pts, chunksize=128))
+    except Exception:
+        return [_volumen_de_puntos(p) for p in lista_pts]
+
+
+# Ordena y recorta una cara interna a partir de sus vértices crudos. Se ejecuta
+# en los procesos paralelos, por eso no toca variables globales.
+def _geometria_cara_interna(arista_vor):
     a = np.asarray(arista_vor, dtype=float)
     a = a[~np.isnan(a).any(axis=1)]
     if len(a) < 3:
         return None
-    loop = recortar_poligono_caja(ordenar_poligono_planar(a))
-    if len(loop) < 3:
+    ciclo = recortar_poligono_caja(ordenar_poligono_planar(a))
+    if len(ciclo) < 3:
         return None
-    return loop
+    return ciclo
 
 
 # Calcula en paralelo la geometría de muchas caras internas. Con pocas caras o sin
 # paralelismo lo resuelve en serie.
-def _geom_caras_paralelo(lista_aristas):
+def _geometria_caras_paralelo(lista_aristas):
     if not usar_paralelo or len(lista_aristas) < 1500:
-        return [_geom_cara_interna(a) for a in lista_aristas]
+        return [_geometria_cara_interna(a) for a in lista_aristas]
     try:
-        ex = _get_exec()
-        return list(ex.map(_geom_cara_interna, lista_aristas, chunksize=128))
+        ex = _obtener_ejecutor()
+        return list(ex.map(_geometria_cara_interna, lista_aristas, chunksize=128))
     except Exception:
-        return [_geom_cara_interna(a) for a in lista_aristas]
+        return [_geometria_cara_interna(a) for a in lista_aristas]
 
 
 def voronoi_base(todas_semillas=None):
@@ -427,12 +446,12 @@ def asignar_clusters_voronoi(celdas, semilla_celda, vor, vol_por_clase, pos_bord
     # borde del dominio queda como matriz.
     n_tipos = len(tipos_agregado)
 
-    seed_to_pos = {s: pos for pos, s in enumerate(semilla_celda)}
+    semilla_a_pos = {s: pos for pos, s in enumerate(semilla_celda)}
     vecinos = {}
     for rp in vor.ridge_points:
         s1, s2 = int(rp[0]), int(rp[1])
-        p1 = seed_to_pos.get(s1)
-        p2 = seed_to_pos.get(s2)
+        p1 = semilla_a_pos.get(s1)
+        p2 = semilla_a_pos.get(s2)
         if p1 is None or p2 is None:
             continue
         vecinos.setdefault(p1, set()).add(p2)
@@ -440,10 +459,9 @@ def asignar_clusters_voronoi(celdas, semilla_celda, vor, vol_por_clase, pos_bord
 
     # Centroides rápidos (media de vértices, sin ConvexHull)
     centroides = [np.mean(np.asarray(c, dtype=float), axis=0) for c in celdas]
-    # Volumen uniforme por celda: suficiente para el criterio de parada del crecimiento.
-    # Voronoi particiona exactamente el dominio, así que la suma es vol_dominio.
-    vol_cel_uniforme = vol_dominio / max(1, len(celdas))
-    vols_celdas = [vol_cel_uniforme] * len(celdas)
+    # Volumen real de cada celda, para que la fracción de agregado que se alcanza
+    # coincida con frac_agregado (no con un conteo aproximado de celdas).
+    vols_celdas = _volumenes_de_celdas([np.asarray(c, dtype=float) for c in celdas])
 
     # Lista de partículas por tipo (mayor volumen primero). Después se entrelazan
     # los tipos para que cada uno reciba espacio en proporción a su número de
@@ -552,7 +570,7 @@ def asignar_clusters_voronoi(celdas, semilla_celda, vor, vol_por_clase, pos_bord
         for p_r in casc_r:
             tipo_de_cluster[cluster_de_celda[p_r]] = k_r
 
-    vol_agg     = len(cluster_de_celda) * vol_cel_uniforme
+    vol_agg     = float(sum(vols_celdas[p] for p in cluster_de_celda))
     objetivo_agg = vol_agregado_total
 
     frontera_rec = set()
@@ -561,8 +579,8 @@ def asignar_clusters_voronoi(celdas, semilla_celda, vor, vol_por_clase, pos_bord
             if n_r not in cluster_de_celda and n_r not in pos_borde:
                 frontera_rec.add(n_r)
 
-    # El relleno avanza por niveles (BFS) desde los agregados hacia afuera, así que
-    # las celdas más cercanas se toman primero sin necesidad de ordenar.
+    # El relleno avanza por niveles, desde los agregados hacia afuera, así que las
+    # celdas más cercanas se toman primero sin necesidad de ordenarlas.
     while frontera_rec and vol_agg < objetivo_agg:
         siguiente_rec = set()
         for cell in frontera_rec:
@@ -581,7 +599,7 @@ def asignar_clusters_voronoi(celdas, semilla_celda, vor, vol_por_clase, pos_bord
             k_r = tipo_de_cluster[cid]
             cascaras_por_tipo[k_r][cell] = celdas[cell]
             cluster_de_celda[cell] = cid
-            vol_agg += vol_cel_uniforme
+            vol_agg += vols_celdas[cell]
             for nb in vecinos.get(cell, set()):
                 if nb not in cluster_de_celda and nb not in pos_borde:
                     siguiente_rec.add(nb)
@@ -691,13 +709,12 @@ def graficar_3d(matriz_verts, agregados_grafico):
 
 def resumen(cascaras_por_tipo, matriz_verts):
     # Usa conteo de celdas × volumen uniforme para evitar N_fino llamadas a ConvexHull.
-    n_total_celdas = sum(len(c) for c in cascaras_por_tipo) + len(matriz_verts)
-    vc = vol_dominio / max(1, n_total_celdas)
-
-    n_tipo   = [len(casc) for casc in cascaras_por_tipo]
-    vols_tipo = [n * vc for n in n_tipo]
+    # Volumen real (ConvexHull) por tipo; la matriz es el resto del dominio.
+    n_tipo    = [len(casc) for casc in cascaras_por_tipo]
+    vols_tipo = [float(sum(_volumenes_de_celdas(list(casc.values()))))
+                 for casc in cascaras_por_tipo]
     Vt = sum(vols_tipo)
-    Vm = len(matriz_verts) * vc
+    Vm = vol_dominio - Vt
 
     print("\nResumen:")
     print(f"Volumen dominio    = {vol_dominio:12.1f} mm3")
@@ -787,7 +804,7 @@ def caras_del_casco(hull):
 
 # Limpia un ciclo de nodos: quita repetidos consecutivos, el cierre duplicado y
 # cualquier nodo que aparezca más de una vez.
-def _dedup_loop(ids):
+def _depurar_ciclo(ids):
     out = []
     for v in ids:
         if not out or out[-1] != v:
@@ -806,7 +823,7 @@ def _dedup_loop(ids):
 # Corrige las uniones en T sobre las caras del borde: si un nodo de otra cara cae
 # sobre una arista de borde, lo inserta en el ciclo para que las caras casen. La
 # búsqueda de nodos colineales se hace por bloque (numpy) para no ser O(N^2).
-def _corregir_t_borde(nodo_coords, faces):
+def _corregir_uniones_borde(nodo_coords, poligonos):
     eps = 1e-9
     planos = [(0, 0.0), (0, float(B)), (1, 0.0), (1, float(H)), (2, 0.0), (2, float(D))]
     coords = np.asarray(nodo_coords, dtype=float)
@@ -818,25 +835,25 @@ def _corregir_t_borde(nodo_coords, faces):
         plano_ids[(eje, val)] = sel
         plano_xyz[(eje, val)] = coords[sel]
 
-    for fid in range(len(faces)):
-        loop = faces[fid]
-        if len(loop) < 3:
+    for fid in range(len(poligonos)):
+        ciclo = poligonos[fid]
+        if len(ciclo) < 3:
             continue
         pl = None
         for (eje, val) in planos:
-            if all(abs(coords[n][eje] - val) < eps for n in loop):
+            if all(abs(coords[n][eje] - val) < eps for n in ciclo):
                 pl = (eje, val); break
         if pl is None:
             continue
         cand_ids = plano_ids[pl]
         cand_xyz = plano_xyz[pl]
         if len(cand_ids) == 0:
-            faces[fid] = _dedup_loop(loop)
+            poligonos[fid] = _depurar_ciclo(ciclo)
             continue
         nuevo = []
-        m = len(loop)
+        m = len(ciclo)
         for k in range(m):
-            a = loop[k]; b = loop[(k + 1) % m]
+            a = ciclo[k]; b = ciclo[(k + 1) % m]
             nuevo.append(a)
             pa = coords[a]; pb = coords[b]
             ab = pb - pa; L2 = float(ab @ ab)
@@ -855,15 +872,15 @@ def _corregir_t_borde(nodo_coords, faces):
                 tt = t[mask]; ii = cand_ids[mask]
                 for j in np.argsort(tt, kind="stable"):
                     nuevo.append(int(ii[j]))
-        faces[fid] = _dedup_loop(nuevo)
+        poligonos[fid] = _depurar_ciclo(nuevo)
 
 
 # Red de seguridad: si la superficie de un elemento queda con aristas usadas un
 # número impar de veces (un hueco residual por degeneración), las agrupa en ciclos
 # y los tapa con un abanico de triángulos hasta un nodo central nuevo.
-def _cerrar_huecos(faces_fin, owners_fin, nodo_coords):
+def _cerrar_huecos(poligonos_finales, duenos_finales, nodo_coords):
     elem_fids = {}
-    for fid, owners in enumerate(owners_fin):
+    for fid, owners in enumerate(duenos_finales):
         for e in owners:
             elem_fids.setdefault(e, []).append(fid)
 
@@ -879,12 +896,12 @@ def _cerrar_huecos(faces_fin, owners_fin, nodo_coords):
     for e, fids in elem_fids.items():
         cnt = {}
         for fid in fids:
-            loop = faces_fin[fid]
-            if loop is None:
+            ciclo = poligonos_finales[fid]
+            if ciclo is None:
                 continue
-            m = len(loop)
+            m = len(ciclo)
             for k in range(m):
-                a = loop[k]; b = loop[(k + 1) % m]
+                a = ciclo[k]; b = ciclo[(k + 1) % m]
                 if a == b:
                     continue
                 key = (a, b) if a < b else (b, a)
@@ -916,8 +933,8 @@ def _cerrar_huecos(faces_fin, owners_fin, nodo_coords):
         cid = len(nodo_coords)
         nodo_coords.append(np.asarray(cc, dtype=float))
         for a, b in edges:
-            faces_fin.append([cid, a, b])
-            owners_fin.append(list(owners))
+            poligonos_finales.append([cid, a, b])
+            duenos_finales.append(list(owners))
         n_tapados += 1
     return n_tapados
 
@@ -925,11 +942,11 @@ def _cerrar_huecos(faces_fin, owners_fin, nodo_coords):
 # Cuando dos vértices de Voronoi caen casi en el mismo punto, la celda no cierra.
 # En cada celda con aristas sueltas se funde el par de nodos más cercano y, si eso
 # daña a un vecino, se revierte. Las celdas que ya estaban bien no se tocan.
-def _reparar_near_dups(faces_fin, owners_fin, nodo_coords, tol_par=1e-2):
+def _reparar_nodos_pegados(poligonos_finales, duenos_finales, nodo_coords, tol_par=1e-2):
     def elem_fids_map():
         m = {}
-        for fid, ow in enumerate(owners_fin):
-            if faces_fin[fid] is None:
+        for fid, ow in enumerate(duenos_finales):
+            if poligonos_finales[fid] is None:
                 continue
             for e in ow:
                 m.setdefault(e, []).append(fid)
@@ -938,12 +955,12 @@ def _reparar_near_dups(faces_fin, owners_fin, nodo_coords, tol_par=1e-2):
     def aristas_impares(fids):
         cnt = {}
         for fid in fids:
-            loop = faces_fin[fid]
-            if loop is None:
+            ciclo = poligonos_finales[fid]
+            if ciclo is None:
                 continue
-            m = len(loop)
+            m = len(ciclo)
             for k in range(m):
-                a = loop[k]; b = loop[(k + 1) % m]
+                a = ciclo[k]; b = ciclo[(k + 1) % m]
                 if a == b:
                     continue
                 key = (a, b) if a < b else (b, a)
@@ -952,10 +969,10 @@ def _reparar_near_dups(faces_fin, owners_fin, nodo_coords, tol_par=1e-2):
 
     def nodo_fids():
         m = {}
-        for fid, loop in enumerate(faces_fin):
-            if loop is None:
+        for fid, ciclo in enumerate(poligonos_finales):
+            if ciclo is None:
                 continue
-            for n in loop:
+            for n in ciclo:
                 m.setdefault(n, set()).add(fid)
         return m
 
@@ -970,7 +987,7 @@ def _reparar_near_dups(faces_fin, owners_fin, nodo_coords, tol_par=1e-2):
             fids = elem_fids_map().get(e, [])
             if aristas_impares(fids) == 0:
                 break
-            alln = sorted({n for fid in fids for n in faces_fin[fid]})
+            alln = sorted({n for fid in fids for n in poligonos_finales[fid]})
             P = np.array([nodo_coords[n] for n in alln])
             best = None; bd = 1e18
             for i in range(len(alln)):
@@ -985,25 +1002,25 @@ def _reparar_near_dups(faces_fin, owners_fin, nodo_coords, tol_par=1e-2):
                 break
             a, b = best
             fb = list(n2f.get(b, set()))
-            snap = {fid: (list(faces_fin[fid]) if faces_fin[fid] is not None
+            snap = {fid: (list(poligonos_finales[fid]) if poligonos_finales[fid] is not None
                           else None) for fid in fb}
             afect = set()
             for fid in fb:
-                if faces_fin[fid] is not None:
-                    afect.update(owners_fin[fid])
+                if poligonos_finales[fid] is not None:
+                    afect.update(duenos_finales[fid])
             imp_antes = {ae: aristas_impares(elem.get(ae, [])) for ae in afect}
             for fid in fb:
-                loop = faces_fin[fid]
-                if loop is None:
+                ciclo = poligonos_finales[fid]
+                if ciclo is None:
                     continue
-                nl = [a if x == b else x for x in loop]
+                nl = [a if x == b else x for x in ciclo]
                 cl = []
                 for x in nl:
                     if not cl or cl[-1] != x:
                         cl.append(x)
                 while len(cl) > 1 and cl[0] == cl[-1]:
                     cl.pop()
-                faces_fin[fid] = cl if len(cl) >= 3 else None
+                poligonos_finales[fid] = cl if len(cl) >= 3 else None
             n2f[a] = n2f.get(a, set()) | n2f.get(b, set())
             n2f[b] = set()
             elem = elem_fids_map()
@@ -1015,7 +1032,7 @@ def _reparar_near_dups(faces_fin, owners_fin, nodo_coords, tol_par=1e-2):
                     malo = True; break
             if malo:
                 for fid, old in snap.items():
-                    faces_fin[fid] = old
+                    poligonos_finales[fid] = old
                 n2f = nodo_fids()
                 elem = elem_fids_map()
                 break
@@ -1027,13 +1044,13 @@ def _reparar_near_dups(faces_fin, owners_fin, nodo_coords, tol_par=1e-2):
 # El VEM necesita caras planas. La fusión de nodos deja unas pocas caras levemente
 # alabeadas: se parten en triángulos (un triángulo siempre es plano), reemplazando
 # la cara en sus dos dueños para no romper la conformidad.
-def _aplanar_caras(faces_fin, owners_fin, nodo_coords, tol=1e-9):
+def _aplanar_caras(poligonos_finales, duenos_finales, nodo_coords, tol=1e-9):
     n_tri = 0
-    for fid in range(len(faces_fin)):
-        loop = faces_fin[fid]
-        if loop is None or len(loop) < 4:
+    for fid in range(len(poligonos_finales)):
+        ciclo = poligonos_finales[fid]
+        if ciclo is None or len(ciclo) < 4:
             continue
-        pts = np.array([nodo_coords[n] for n in loop])
+        pts = np.array([nodo_coords[n] for n in ciclo])
         c = pts.mean(axis=0)
         try:
             _, _, Vt = np.linalg.svd(pts - c, full_matrices=False)
@@ -1046,12 +1063,12 @@ def _aplanar_caras(faces_fin, owners_fin, nodo_coords, tol=1e-9):
             continue
         cid = len(nodo_coords)
         nodo_coords.append(np.asarray(c, dtype=float))
-        ow = owners_fin[fid]
-        m = len(loop)
-        faces_fin[fid] = [cid, loop[0], loop[1]]
+        ow = duenos_finales[fid]
+        m = len(ciclo)
+        poligonos_finales[fid] = [cid, ciclo[0], ciclo[1]]
         for k in range(1, m):
-            faces_fin.append([cid, loop[k], loop[(k + 1) % m]])
-            owners_fin.append(list(ow))
+            poligonos_finales.append([cid, ciclo[k], ciclo[(k + 1) % m]])
+            duenos_finales.append(list(ow))
         n_tri += 1
     return n_tri
 
@@ -1078,7 +1095,7 @@ def generar_malla_fem(celdas, clases_de_celda, semillas_de_celda, vor, deform_sp
     if deform_specs is None:
         deform_specs = {}
     eps_b = 1e-9
-    seed_to_pos = {s: pos for pos, s in enumerate(semillas_de_celda)}
+    semilla_a_pos = {s: pos for pos, s in enumerate(semillas_de_celda)}
     semillas_validas = set(semillas_de_celda)
 
     # Asigna un id único a cada nodo, pegando al plano del borde los que están casi
@@ -1099,42 +1116,42 @@ def generar_malla_fem(celdas, clases_de_celda, semillas_de_celda, vor, deform_sp
             nodo_coords.append(v)
         return nodo_id[k]
 
-    faces        = []
-    face_owners  = []
-    elem_faces   = {}
+    poligonos        = []
+    duenos_poligono  = []
+    caras_de_celda   = {}
 
-    # Caras internas: primero se juntan los ridges válidos y se calcula su geometría
-    # en paralelo (lo pesado); luego se registran los nodos en serie (rápido).
-    ridges_validos = []
+    # Caras internas: primero se juntan las caras compartidas válidas y se calcula
+    # su geometría en paralelo (lo pesado); luego se registran los nodos en serie.
+    caras_validas = []
     for r_idx, vert_idxs in enumerate(vor.ridge_vertices):
         s1, s2 = int(vor.ridge_points[r_idx][0]), int(vor.ridge_points[r_idx][1])
         if s1 not in semillas_validas or s2 not in semillas_validas:
             continue
         if -1 in vert_idxs:
             continue
-        p1 = seed_to_pos.get(s1); p2 = seed_to_pos.get(s2)
+        p1 = semilla_a_pos.get(s1); p2 = semilla_a_pos.get(s2)
         if p1 is None or p2 is None:
             continue
         av = vor.vertices[vert_idxs]
         av = av[~np.isnan(av).any(axis=1)]
         if len(av) < 3:
             continue
-        ridges_validos.append((p1, p2, av))
+        caras_validas.append((p1, p2, av))
 
-    loops = _geom_caras_paralelo([rv[2] for rv in ridges_validos])
+    ciclos = _geometria_caras_paralelo([rv[2] for rv in caras_validas])
 
     # Registra cada cara interna: da id a sus nodos y la asocia a las dos celdas
     # que la comparten.
-    for (p1, p2, _av), loop in zip(ridges_validos, loops):
-        if loop is None or len(loop) < 3:
+    for (p1, p2, _av), ciclo in zip(caras_validas, ciclos):
+        if ciclo is None or len(ciclo) < 3:
             continue
-        ids = _dedup_loop([id_nodo(p) for p in loop])
+        ids = _depurar_ciclo([id_nodo(p) for p in ciclo])
         if len(ids) < 3:
             continue
-        fid = len(faces)
-        faces.append(ids); face_owners.append([p1, p2])
-        elem_faces.setdefault(p1, []).append(fid)
-        elem_faces.setdefault(p2, []).append(fid)
+        fid = len(poligonos)
+        poligonos.append(ids); duenos_poligono.append([p1, p2])
+        caras_de_celda.setdefault(p1, []).append(fid)
+        caras_de_celda.setdefault(p2, []).append(fid)
 
     # Caras de borde del dominio
     planos_caja = [(0, 0.0), (0, float(B)), (1, 0.0), (1, float(H)),
@@ -1146,17 +1163,17 @@ def generar_malla_fem(celdas, clases_de_celda, semillas_de_celda, vor, deform_sp
             if len(en) < 3:
                 continue
             en = en.copy(); en[:, eje] = val
-            loop = ordenar_poligono_planar(en)
-            if len(loop) < 3:
+            ciclo = ordenar_poligono_planar(en)
+            if len(ciclo) < 3:
                 continue
-            ids = _dedup_loop([id_nodo(p) for p in loop])
+            ids = _depurar_ciclo([id_nodo(p) for p in ciclo])
             if len(ids) < 3:
                 continue
-            fid = len(faces)
-            faces.append(ids); face_owners.append([pos])
-            elem_faces.setdefault(pos, []).append(fid)
+            fid = len(poligonos)
+            poligonos.append(ids); duenos_poligono.append([pos])
+            caras_de_celda.setdefault(pos, []).append(fid)
 
-    _corregir_t_borde(nodo_coords, faces)
+    _corregir_uniones_borde(nodo_coords, poligonos)
 
     # Nodos que NO se pueden mover sin romper conformidad: los del borde y los
     # compartidos por dos agregados distintos.
@@ -1169,19 +1186,19 @@ def generar_malla_fem(celdas, clases_de_celda, semillas_de_celda, vor, deform_sp
             nodo_en_borde.add(nid)
 
     aggs_de_nodo = {}
-    for pos, fids in elem_faces.items():
+    for pos, fids in caras_de_celda.items():
         if clases_de_celda[pos] <= 0:
             continue
         for fid in fids:
-            for n in faces[fid]:
+            for n in poligonos[fid]:
                 aggs_de_nodo.setdefault(n, set()).add(pos)
 
     # Elongación / aplanamiento: solo se mueven nodos libres (no borde y de un solo
     # agregado), para mantener la conformidad.
     nodos_movidos = set()
     for pos, (factor, axis) in deform_specs.items():
-        fids = elem_faces.get(pos, [])
-        node_ids = list({n for fid in fids for n in faces[fid]})
+        fids = caras_de_celda.get(pos, [])
+        node_ids = list({n for fid in fids for n in poligonos[fid]})
         if len(node_ids) < 4:
             continue
         if any(n in nodo_en_borde for n in node_ids):
@@ -1209,41 +1226,41 @@ def generar_malla_fem(celdas, clases_de_celda, semillas_de_celda, vor, deform_sp
                 nodos_movidos.add(n)
 
     # Triangular caras tocadas por la deformación; las demás quedan como polígono.
-    faces_fin   = []
-    owners_fin  = []
+    poligonos_finales   = []
+    duenos_finales  = []
 
-    def add_face(loop, owners):
-        faces_fin.append(loop); owners_fin.append(owners)
-        return len(faces_fin) - 1
+    def agregar_poligono(ciclo, owners):
+        poligonos_finales.append(ciclo); duenos_finales.append(owners)
+        return len(poligonos_finales) - 1
 
-    for fid in range(len(faces)):
-        loop = faces[fid]
-        owners = face_owners[fid]
-        if len(loop) < 3:
+    for fid in range(len(poligonos)):
+        ciclo = poligonos[fid]
+        owners = duenos_poligono[fid]
+        if len(ciclo) < 3:
             continue
-        tocada = any(n in nodos_movidos for n in loop)
-        if not tocada or len(loop) == 3:
-            add_face(loop, owners)
+        tocada = any(n in nodos_movidos for n in ciclo)
+        if not tocada or len(ciclo) == 3:
+            agregar_poligono(ciclo, owners)
         else:
-            cc = np.mean([nodo_coords[n] for n in loop], axis=0)
+            cc = np.mean([nodo_coords[n] for n in ciclo], axis=0)
             cid = len(nodo_coords)
             nodo_coords.append(np.asarray(cc, dtype=float))
-            mloop = len(loop)
+            mloop = len(ciclo)
             for k in range(mloop):
-                a = loop[k]; b = loop[(k + 1) % mloop]
+                a = ciclo[k]; b = ciclo[(k + 1) % mloop]
                 if a == b:
                     continue
-                add_face([cid, a, b], owners)
+                agregar_poligono([cid, a, b], owners)
 
-    n_reparados = _reparar_near_dups(faces_fin, owners_fin, nodo_coords)
+    n_reparados = _reparar_nodos_pegados(poligonos_finales, duenos_finales, nodo_coords)
     if n_reparados:
         print(f"  (se repararon {n_reparados} celdas con vértices casi coincidentes)")
 
-    n_tapados = _cerrar_huecos(faces_fin, owners_fin, nodo_coords)
+    n_tapados = _cerrar_huecos(poligonos_finales, duenos_finales, nodo_coords)
     if n_tapados:
         print(f"  (se cerraron {n_tapados} huecos residuales por degeneración)")
 
-    _aplanar_caras(faces_fin, owners_fin, nodo_coords)
+    _aplanar_caras(poligonos_finales, duenos_finales, nodo_coords)
 
     # Construir aristas, caras y elementos
     arista_id = {}
@@ -1257,22 +1274,22 @@ def generar_malla_fem(celdas, clases_de_celda, semillas_de_celda, vor, deform_sp
         return arista_id[ka]
 
     caras = []
-    elem_faces_fin = {}
-    for fid, loop in enumerate(faces_fin):
-        if loop is None or len(loop) < 3:
+    caras_finales_de_celda = {}
+    for fid, ciclo in enumerate(poligonos_finales):
+        if ciclo is None or len(ciclo) < 3:
             continue
-        m = len(loop)
-        eids = [id_arista(loop[k], loop[(k + 1) % m]) for k in range(m)]
+        m = len(ciclo)
+        eids = [id_arista(ciclo[k], ciclo[(k + 1) % m]) for k in range(m)]
         new_fid = len(caras)
         caras.append(eids)
-        for pos in owners_fin[fid]:
-            elem_faces_fin.setdefault(pos, []).append(new_fid)
+        for pos in duenos_finales[fid]:
+            caras_finales_de_celda.setdefault(pos, []).append(new_fid)
 
     # Cada elemento es la lista de caras de una celda; guarda también su clase.
     elementos = []
     elem_clase = []
     for pos in range(len(celdas)):
-        fids = elem_faces_fin.get(pos)
+        fids = caras_finales_de_celda.get(pos)
         if not fids:
             continue
         elementos.append(list(dict.fromkeys(fids)))
@@ -1524,13 +1541,12 @@ def main():
         clases_fem.append(clase_de_semilla.get(s_idx, 0))
         semillas_fem.append(s_idx)
 
-    # Fracción real: usando volumen de celda uniforme para evitar N_fino llamadas a ConvexHull.
-    # Voronoi particiona exactamente el dominio → vol_total ≈ vol_dominio.
-    vol_cel_aprox = vol_dominio / max(1, len(vertices_fem))
-    n_agg_cells   = sum(1 for c in clases_fem if c != 0)
-    vol_agregado_fem = n_agg_cells * vol_cel_aprox
-    vol_total_fem    = vol_dominio
-    fraccion_real = vol_agregado_fem / vol_total_fem
+    # Fracción real: se suma el volumen verdadero (ConvexHull) de cada celda de
+    # agregado. La suma de todas las celdas recortadas es exactamente vol_dominio,
+    # así que ese es el total.
+    nubes_agg = [vertices_fem[pos] for pos, c in enumerate(clases_fem) if c != 0]
+    vol_agregado_fem = float(sum(_volumenes_de_celdas(nubes_agg)))
+    fraccion_real = vol_agregado_fem / vol_dominio
     print(f"\nFracción real de agregado en la malla VEM:")
     print(f"  Objetivo   : {100 * frac_agregado:.2f}%  ({vol_agregado_total:.1f} mm3)")
     print(f"  Real : {100 * fraccion_real:.2f}%  ({vol_agregado_fem:.1f} mm3)")
